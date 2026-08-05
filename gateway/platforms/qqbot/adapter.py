@@ -278,8 +278,15 @@ class QQAdapter(BasePlatformAdapter):
     # Connection lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
-        """Authenticate, obtain gateway URL, and open the WebSocket."""
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Authenticate, obtain gateway URL, and open the WebSocket.
+
+        is_reconnect (07-24 v0.18.2 fix): gateway.run.py:3458 重连路径传
+        is_reconnect 标记，adapter 接收但 v0.18.2 的 fork adapter 没声明这个
+        kwarg → "unexpected keyword argument" 5min retry 死循环。
+        兼容旧调用（connect() 不传 = False = 首次连接）。
+        Keyword-only 匹配父类 BasePlatformAdapter.connect (gateway/platforms/base.py:2864)。
+        """
         if not AIOHTTP_AVAILABLE:
             message = "QQ startup failed: aiohttp not installed"
             self._set_fatal_error("qq_missing_dependency", message, retryable=True)
