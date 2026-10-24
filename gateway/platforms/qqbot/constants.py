@@ -40,6 +40,16 @@ CONNECT_TIMEOUT_SECONDS = 20.0
 
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 MAX_RECONNECT_ATTEMPTS = 100
+
+# Transport-level failures (DNS outage, network loss, proxy hiccup) are not
+# permanent: the peer side is fine, only our path to it is broken.  A DNS
+# blackhole that lasts longer than MAX_RECONNECT_ATTEMPTS previously killed
+# the adapter for the rest of the gateway lifetime ("Max reconnect attempts
+# reached") even though other platforms (Feishu / Weixin) kept retrying and
+# recovered on their own.  Keep retrying forever once the attempt cap is
+# hit — the backoff is already capped at RECONNECT_BACKOFF[-1] seconds, so the
+# retry loop stays cheap.
+RETRY_FOREVER_ON_TRANSPORT_ERROR = True
 RATE_LIMIT_DELAY = 60  # seconds
 QUICK_DISCONNECT_THRESHOLD = 5.0  # seconds
 MAX_QUICK_DISCONNECT_COUNT = 3
