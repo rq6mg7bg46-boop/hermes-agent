@@ -3,6 +3,7 @@ SQLite-backed fact store with entity resolution and trust scoring.
 Single-user Hermes memory store plugin.
 """
 
+import os
 import re
 import sqlite3
 import threading
@@ -65,6 +66,35 @@ CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
         VALUES (new.fact_id, new.content, new.tags);
 END;
 
+-- Trigram FTS5 table for CJK substring search. The default unicode61
+-- tokenizer treats a run of CJK characters as ONE token ("老板拍板" is a
+-- single token), so a query for a sub-phrase ("老板") matches nothing.
+-- The trigram tokenizer indexes overlapping 3-character sequences, which
+-- makes substring queries work for any script. Mirrors the core
+-- messages_fts_trigram design in hermes_state_common.py (FTS_TRIGRAM_SQL):
+-- a dedicated table populated by its own triggers, queried as a fallback
+-- when the base index returns nothing.
+CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts_trigram
+    USING fts5(content, tags, content=facts, content_rowid=fact_id,
+               tokenize='trigram');
+
+CREATE TRIGGER IF NOT EXISTS facts_tri_ai AFTER INSERT ON facts BEGIN
+    INSERT INTO facts_fts_trigram(rowid, content, tags)
+        VALUES (new.fact_id, new.content, new.tags);
+END;
+
+CREATE TRIGGER IF NOT EXISTS facts_tri_ad AFTER DELETE ON facts BEGIN
+    INSERT INTO facts_fts_trigram(facts_fts_trigram, rowid, content, tags)
+        VALUES ('delete', old.fact_id, old.content, old.tags);
+END;
+
+CREATE TRIGGER IF NOT EXISTS facts_tri_au AFTER UPDATE ON facts BEGIN
+    INSERT INTO facts_fts_trigram(facts_fts_trigram, rowid, content, tags)
+        VALUES ('delete', old.fact_id, old.content, old.tags);
+    INSERT INTO facts_fts_trigram(rowid, content, tags)
+        VALUES (new.fact_id, new.content, new.tags);
+END;
+
 CREATE TABLE IF NOT EXISTS memory_banks (
     bank_id    INTEGER PRIMARY KEY AUTOINCREMENT,
     bank_name  TEXT NOT NULL UNIQUE,
@@ -98,6 +128,21 @@ def _clamp_trust(value: float) -> float:
 class MemoryStore:
     """SQLite-backed fact store with entity resolution and trust scoring."""
 
+    # --- Process-wide shared connection registry -------------------------
+    # SQLite permits only one writer at a time. Each MemoryStore instance used
+    # to open its own connection guarded by its own RLock, so the several
+    # providers that coexist in one process (the main agent plus every
+    # delegate_task subagent) raced as independent WAL writers. Combined with
+    # writes that were not rolled back on error, one connection could leave an
+    # open write transaction that pinned the write lock and made every other
+    # connection's write fail with "database is locked" for the full busy
+    # timeout. All instances for the same database now share ONE connection and
+    # ONE re-entrant lock, so access is fully serialized and cross-connection
+    # contention is impossible. The shared connection is refcounted, so closing
+    # one instance never tears the connection out from under a live sibling.
+    _shared: dict = {}
+    _shared_guard = threading.Lock()
+
     def __init__(
         self,
         db_path: "str | Path | None" = None,
@@ -112,14 +157,41 @@ class MemoryStore:
         self.default_trust = _clamp_trust(default_trust)
         self.hrr_dim = hrr_dim
         self._hrr_available = hrr._HAS_NUMPY
-        self._conn: sqlite3.Connection = sqlite3.connect(
-            str(self.db_path),
-            check_same_thread=False,
-            timeout=10.0,
-        )
-        self._lock = threading.RLock()
-        self._conn.row_factory = sqlite3.Row
-        self._init_db()
+
+        # Acquire (or open) the process-wide shared connection for this DB.
+        # resolve() (not just expanduser) so symlinked/relative paths to the
+        # same file share ONE connection instead of silently reintroducing
+        # the multi-writer contention this registry exists to prevent.
+        try:
+            self._key = str(self.db_path.resolve())
+        except OSError:
+            self._key = str(self.db_path)
+        with MemoryStore._shared_guard:
+            entry = MemoryStore._shared.get(self._key)
+            if entry is None:
+                conn = sqlite3.connect(
+                    self._key,
+                    check_same_thread=False,
+                    timeout=10.0,
+                    # Autocommit: every statement is its own transaction, so a
+                    # write that raises mid-method can never leave a dangling
+                    # transaction (and its write lock) open. The explicit
+                    # commit() calls below become harmless no-ops.
+                    isolation_level=None,
+                )
+                conn.row_factory = sqlite3.Row
+                entry = {"conn": conn, "lock": threading.RLock(), "refs": 0, "ready": False}
+                MemoryStore._shared[self._key] = entry
+            entry["refs"] += 1
+            self._entry = entry
+            self._conn = entry["conn"]
+            self._lock = entry["lock"]
+
+        # Initialise the schema once per shared connection.
+        with self._lock:
+            if not self._entry["ready"]:
+                self._init_db()
+                self._entry["ready"] = True
 
     # ------------------------------------------------------------------
     # Initialisation
@@ -137,7 +209,36 @@ class MemoryStore:
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(facts)").fetchall()}
         if "hrr_vector" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN hrr_vector BLOB")
+        self._backfill_trigram_index()
         self._conn.commit()
+
+    def _backfill_trigram_index(self) -> None:
+        """Populate the trigram index for facts that predate it.
+
+        ``facts_fts_trigram`` is a contentless FTS5 table (``content=facts``):
+        creating it does NOT index the rows that already exist in ``facts``.
+        The insert/delete/update triggers only cover future writes, so an
+        existing store would silently keep zero trigram hits until every
+        fact was rewritten. Backfill the missing rows with the same
+        NOT EXISTS guard the core message search uses for its trigram
+        backfill (hermes_state_search.py fts_rebuild_step).
+        """
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO facts_fts_trigram(rowid, content, tags)
+                SELECT f.fact_id, f.content, f.tags
+                FROM facts f
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM facts_fts_trigram_docsize d WHERE d.id = f.fact_id
+                )
+                """
+            )
+        except sqlite3.OperationalError:
+            # The trigram tokenizer may be missing from this SQLite build.
+            # The base unicode61 index still works, so retrieval degrades to
+            # whole-token matching instead of failing outright.
+            pass
 
     # ------------------------------------------------------------------
     # Public API
@@ -519,7 +620,7 @@ class MemoryStore:
                 self._conn.commit()
                 return
 
-            vectors = [hrr.bytes_to_phases(row["hrr_vector"]) for row in rows]
+            vectors = [hrr.bytes_to_phases(row["hrr_vector"], dim=self.hrr_dim) for row in rows]
             bank_vector = hrr.bundle(*vectors)
             fact_count = len(vectors)
 
@@ -574,9 +675,69 @@ class MemoryStore:
         """Convert a sqlite3.Row to a plain dict."""
         return dict(row)
 
+    @classmethod
+    def release_all_under(cls, directory: "str | Path") -> int:
+        """Force-close every shared connection whose database lives under ``directory``.
+
+        ``close()`` is refcount-driven, so a live holder (e.g. an agent's
+        memory provider) keeps a profile's SQLite handle open indefinitely.
+        That is exactly what a profile delete must break on Windows: the
+        desktop's main ``serve`` process opens ``memory_store.db`` for every
+        known profile, and ``rmtree`` of the profile directory fails with
+        ``WinError 32`` while any of those handles is open (#88347). This
+        closes the matching connections unconditionally — the directory is
+        going away, so later use by a stale holder is expected to fail — and
+        returns how many were closed. In a process that holds none (e.g. the
+        CLI deleting from outside serve) this is a harmless no-op returning 0.
+        """
+        root = os.path.normcase(str(Path(directory).expanduser().resolve())) + os.sep
+        with cls._shared_guard:
+            # Snapshot the keys first so the registry stays stable while
+            # connections are closed inside their per-database locks (closing
+            # can run no user code, but this keeps the invariant obvious).
+            doomed = [
+                key
+                for key in cls._shared
+                if os.path.normcase(key).startswith(root)
+            ]
+            for key in doomed:
+                entry = cls._shared.pop(key)
+                try:
+                    with entry["lock"]:
+                        entry["conn"].close()
+                except Exception:
+                    # A connection that is already closed or broken must not
+                    # abort releasing its siblings.
+                    pass
+        return len(doomed)
+
     def close(self) -> None:
-        """Close the database connection."""
-        self._conn.close()
+        """Release this instance's reference to the shared connection.
+
+        The underlying connection is closed only when the last MemoryStore
+        referencing the same database is closed, so closing one instance can
+        never break sibling instances that still hold it. Idempotent.
+        """
+        if getattr(self, "_entry", None) is None:
+            return
+        with MemoryStore._shared_guard:
+            entry = self._entry
+            if entry is None:
+                return
+            entry["refs"] -= 1
+            if entry["refs"] <= 0:
+                try:
+                    entry["conn"].close()
+                finally:
+                    # Pop only OUR entry. After release_all_under() force-
+                    # closed this entry (profile delete, #88347) a same-path
+                    # store may have re-registered a FRESH entry under the
+                    # same key; a stale holder's late close() must not evict
+                    # it — that would silently reintroduce the multi-writer
+                    # contention this registry exists to prevent.
+                    if MemoryStore._shared.get(self._key) is entry:
+                        MemoryStore._shared.pop(self._key, None)
+            self._entry = None
 
     def __enter__(self) -> "MemoryStore":
         return self

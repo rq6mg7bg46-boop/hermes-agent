@@ -70,6 +70,15 @@ class FactRetriever:
 
         # Stage 2: Rerank with Jaccard + trust + optional decay
         query_tokens = self._tokenize(query)
+        # The query vector is loop-invariant — encode it at most once, on
+        # the first candidate that actually carries an HRR vector. Lazy on
+        # purpose: migrated stores can have FTS candidates whose hrr_vector
+        # was never backfilled (MemoryStore._init_db adds the column
+        # without backfilling), and those must not pay for an encode
+        # nothing will use. encode_text is deterministic (SHA-256 counter
+        # blocks), so the hoisted vector is bit-identical to what the
+        # per-candidate calls produced.
+        query_vec = None
         scored = []
 
         for fact in candidates:
@@ -82,8 +91,9 @@ class FactRetriever:
 
             # HRR similarity
             if self.hrr_weight > 0 and fact.get("hrr_vector"):
-                fact_vec = hrr.bytes_to_phases(fact["hrr_vector"])
-                query_vec = hrr.encode_text(query, self.hrr_dim)
+                fact_vec = hrr.bytes_to_phases(fact["hrr_vector"], dim=self.hrr_dim)
+                if query_vec is None:
+                    query_vec = hrr.encode_text(query, self.hrr_dim)
                 hrr_sim = (hrr.similarity(query_vec, fact_vec) + 1.0) / 2.0  # shift to [0,1]
             else:
                 hrr_sim = 0.5  # neutral
@@ -144,7 +154,7 @@ class FactRetriever:
                 (bank_name,),
             ).fetchone()
             if bank_row:
-                bank_vec = hrr.bytes_to_phases(bank_row["vector"])
+                bank_vec = hrr.bytes_to_phases(bank_row["vector"], dim=self.hrr_dim)
                 extracted = hrr.unbind(bank_vec, probe_key)
                 # Use extracted signal to score individual facts
                 return self._score_facts_by_vector(
@@ -173,14 +183,16 @@ class FactRetriever:
             # Final fallback: keyword search
             return self.search(entity, category=category, limit=limit)
 
+        # role_content is loop-invariant — encode it once (deterministic
+        # SHA-256-based atom) instead of once per fact row.
+        role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
         scored = []
         for row in rows:
             fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
+            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"), dim=self.hrr_dim)
             # Unbind probe key from fact to see if entity is structurally present
             residual = hrr.unbind(fact_vec, probe_key)
             # Compare residual against content signal
-            role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
             content_vec = hrr.bind(hrr.encode_text(fact["content"], self.hrr_dim), role_content)
             sim = hrr.similarity(residual, content_vec)
             fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
@@ -234,17 +246,19 @@ class FactRetriever:
 
         # Score each fact by how much the entity's atom appears in its vector
         # This catches both role-bound entity matches AND content word matches
+        # Both role atoms are loop-invariant — encode them once here
+        # (deterministic SHA-256-based atoms) instead of twice per fact row.
+        role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
+        role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
         scored = []
         for row in rows:
             fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
+            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"), dim=self.hrr_dim)
 
             # Check structural similarity: unbind entity from fact
             residual = hrr.unbind(fact_vec, entity_vec)
             # A high-similarity residual to ANY known role vector means this entity
             # plays a structural role in the fact
-            role_entity = hrr.encode_atom("__hrr_role_entity__", self.hrr_dim)
-            role_content = hrr.encode_atom("__hrr_role_content__", self.hrr_dim)
 
             entity_role_sim = hrr.similarity(residual, role_entity)
             content_role_sim = hrr.similarity(residual, role_content)
@@ -320,7 +334,7 @@ class FactRetriever:
         scored = []
         for row in rows:
             fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
+            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"), dim=self.hrr_dim)
 
             entity_scores = []
             for probe_key in entity_residuals:
@@ -417,8 +431,8 @@ class FactRetriever:
                     continue  # Not enough entity overlap to be contradictory
 
                 # Content similarity via HRR vectors
-                v1 = hrr.bytes_to_phases(f1["hrr_vector"])
-                v2 = hrr.bytes_to_phases(f2["hrr_vector"])
+                v1 = hrr.bytes_to_phases(f1["hrr_vector"], dim=self.hrr_dim)
+                v2 = hrr.bytes_to_phases(f2["hrr_vector"], dim=self.hrr_dim)
                 content_sim = hrr.similarity(v1, v2)
 
                 # High entity overlap + low content similarity = potential contradiction
@@ -470,7 +484,7 @@ class FactRetriever:
         scored = []
         for row in rows:
             fact = dict(row)
-            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"))
+            fact_vec = hrr.bytes_to_phases(fact.pop("hrr_vector"), dim=self.hrr_dim)
             sim = hrr.similarity(target_vec, fact_vec)
             fact["score"] = (sim + 1.0) / 2.0 * fact["trust_score"]
             scored.append(fact)
@@ -489,6 +503,16 @@ class FactRetriever:
 
         Uses the store's database connection directly for FTS5 MATCH
         with rank scoring. Normalizes FTS5 rank to [0, 1] range.
+
+        The base ``facts_fts`` index uses the unicode61 tokenizer, which
+        treats a run of CJK characters as a single token ("老板拍板" is one
+        token). A sub-phrase query ("老板") therefore matches nothing. When
+        the base index comes up empty and every query token is at least 3
+        characters long (the trigram tokenizer indexes overlapping
+        3-character sequences, so shorter tokens can never match), the
+        query is retried against the ``facts_fts_trigram`` index. Mirrors
+        the base-then-trigram fallback in the core message search
+        (hermes_state_search.py search_messages).
         """
         conn = self.store._conn
 
@@ -525,7 +549,10 @@ class FactRetriever:
             rows = conn.execute(sql, params).fetchall()
         except Exception:
             # FTS5 MATCH can fail on malformed queries — fall back to empty
-            return []
+            rows = []
+
+        if not rows:
+            rows = self._trigram_candidates(query, category, min_trust, limit)
 
         if not rows:
             return []
@@ -544,6 +571,81 @@ class FactRetriever:
             results.append(fact)
 
         return results
+
+    @staticmethod
+    def _trigram_eligible_tokens(query: str) -> bool:
+        """True when every query token is long enough for the trigram tokenizer.
+
+        The trigram tokenizer indexes overlapping 3-character sequences, so a
+        token shorter than 3 characters produces no trigrams and can never
+        match. With FTS5's implicit-AND between tokens, one short token makes
+        the whole MATCH return nothing, so the trigram path is only worth
+        taking when every token qualifies. Mirrors the core check in
+        hermes_state_search.py (_trigram_eligible_tokens).
+        """
+        tokens = [
+            t for t in query.strip('"').strip().split()
+            if t.upper() not in {"AND", "OR", "NOT"}
+        ]
+        return bool(tokens) and all(len(t) >= 3 for t in tokens)
+
+    def _trigram_candidates(
+        self,
+        query: str,
+        category: str | None,
+        min_trust: float,
+        limit: int,
+    ) -> list:
+        """Query the trigram FTS index for CJK substring matches.
+
+        Returns the same raw row shape as the base ``_fts_candidates`` query
+        (a ``fts_rank_raw`` column plus the fact columns), so both paths share
+        one normalization step in the caller. Returns [] when the query has
+        no eligible tokens or the trigram index is unavailable.
+        """
+        conn = self.store._conn
+
+        # The trigram tokenizer matches substrings, so the query is passed
+        # through as a quoted phrase — no OR-expansion, because a
+        # substring hit on any fragment is a legitimate result here.
+        tokens = query.strip().split()
+        if not tokens:
+            return []
+        if not self._trigram_eligible_tokens(query):
+            return []
+
+        trigram_query = " ".join(
+            '"' + tok.replace('"', '""') + '"' for tok in tokens
+        )
+
+        where_clauses = ["facts_fts_trigram MATCH ?"]
+        params: list = [trigram_query]
+
+        if category:
+            where_clauses.append("f.category = ?")
+            params.append(category)
+
+        where_clauses.append("f.trust_score >= ?")
+        params.append(min_trust)
+
+        where_sql = " AND ".join(where_clauses)
+
+        sql = f"""
+            SELECT f.*, facts_fts_trigram.rank as fts_rank_raw
+            FROM facts_fts_trigram
+            JOIN facts f ON f.fact_id = facts_fts_trigram.rowid
+            WHERE {where_sql}
+            ORDER BY facts_fts_trigram.rank
+            LIMIT ?
+        """
+        params.append(limit)
+
+        try:
+            return conn.execute(sql, params).fetchall()
+        except Exception:
+            # The trigram tokenizer may be missing from this SQLite build,
+            # or the query may not be expressible as a phrase.
+            return []
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
